@@ -1,0 +1,11 @@
+[Unit]
+Description=Offline Charging Mode
+Documentation=man:systemd.special(7)
+Requires=basic.target
+Conflicts=rescue.service rescue.target
+After=basic.target
+AllowIsolate=yes
+Wants=offline-charger.service
+
+[Install]
+Alias=default.target

@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""
+Offline Charging UI and Power Daemon
+Targeted for Linux on Mobile Devices (Qualcomm SDM845 / Xiaomi Poco F1 beryllium)
+Runs in isolated systemd charger.target, draws UI directly to /dev/fb0 via Cairo,
+handles power/volume buttons, backlight timeout, cable disconnection poweroff,
+and live USB-PD / PPS charging telemetry (Watts, Volts, Amperes, Temperature).
+"""
+
+import os
+import sys
+import time
+import math
+import mmap
+import struct
+import select
+import signal
+import cairo
+
+# ==========================================
+# Display & Framebuffer Configurations
+# ==========================================
+FB_PATH = os.environ.get("OFFLINE_CHARGER_FB", "/dev/fb0")
+WIDTH = int(os.environ.get("OFFLINE_CHARGER_WIDTH", "1080"))
+HEIGHT = int(os.environ.get("OFFLINE_CHARGER_HEIGHT", "2246"))
+STRIDE_FB = int(os.environ.get("OFFLINE_CHARGER_STRIDE", "4352"))
+STRIDE_BUF = WIDTH * 4  # 4 bytes per pixel (ARGB32)
+
+BACKLIGHT_PATH = "/sys/class/backlight/backlight/brightness"
+ACTIVE_BRIGHTNESS = int(os.environ.get("OFFLINE_CHARGER_BRIGHTNESS", "750"))
+TIMEOUT_SCREEN_OFF = 10.0   # seconds before screen sleeps
+UNPLUG_GRACE_TIME = 3.5     # seconds before poweroff on cable disconnect
+HOLD_BOOT_TIME = 2.5        # seconds holding power key to trigger full OS boot
+
+# ==========================================
+# Hardware Sysfs & Power Supply Paths
+# ==========================================
+BAT_CAP_PATH = "/sys/class/power_supply/qcom-battery/capacity"
+BAT_STAT_PATH = "/sys/class/power_supply/qcom-battery/status"
+BAT_CURR_PATH = "/sys/class/power_supply/qcom-battery/current_now"
+BAT_TEMP_PATH = "/sys/class/power_supply/qcom-battery/temp"
+
+CHG_ONLINE_PATH = "/sys/class/power_supply/pmi8998-charger/online"
+
+TCPM_PSY_DIR = "/sys/class/power_supply/tcpm-source-psy-c440000.spmi:pmic@2:typec@1300"
+TCPM_ONLINE_PATH = f"{TCPM_PSY_DIR}/online"
+TCPM_USB_TYPE_PATH = f"{TCPM_PSY_DIR}/usb_type"
+TCPM_VOLT_PATH = f"{TCPM_PSY_DIR}/voltage_now"
+TCPM_CURR_PATH = f"{TCPM_PSY_DIR}/current_now"
+
+INPUT_PATHS = [
+    "/dev/input/by-path/platform-c440000.spmi-platform-c440000.spmi:pmic@0:pon@800:pwrkey-event",
+    "/dev/input/by-path/platform-c440000.spmi-platform-c440000.spmi:pmic@0:pon@800:resin-event",
+    "/dev/input/by-path/platform-gpio-keys-event"
+]
+
+def read_sysfs_int(path, default=0):
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return default
+
+def read_sysfs_str(path, default=""):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+def set_backlight(val):
+    try:
+        with open(BACKLIGHT_PATH, "w") as f:
+            f.write(str(int(val)))
+    except Exception:
+        pass
+
+def is_charger_connected():
+    chg = read_sysfs_int(CHG_ONLINE_PATH, 0)
+    tcpm = read_sysfs_int(TCPM_ONLINE_PATH, 0)
+    stat = read_sysfs_str(BAT_STAT_PATH, "")
+    if chg == 1 or tcpm == 1 or stat in ["Charging", "Full"]:
+        return True
+    return False
+
+def get_charging_telemetry():
+    usb_type_str = read_sysfs_str(TCPM_USB_TYPE_PATH, "")
+    active_type = "USB"
+    supports_pps = "PD_PPS" in usb_type_str
+    if "[" in usb_type_str and "]" in usb_type_str:
+        active_type = usb_type_str.split("[")[1].split("]")[0].strip()
+
+    v_u = read_sysfs_int(TCPM_VOLT_PATH, 0)
+    c_u = read_sysfs_int(TCPM_CURR_PATH, 0)
+
+    volts = v_u / 1000000.0 if v_u > 0 else 0.0
+    amps = c_u / 1000000.0 if c_u > 0 else 0.0
+    watts = volts * amps
+
+    temp_raw = read_sysfs_int(BAT_TEMP_PATH, 0)
+    temp_c = (temp_raw / 10.0) if temp_raw > 0 else None
+
+    return {
+        "active_type": active_type,
+        "supports_pps": supports_pps,
+        "volts": volts,
+        "amps": amps,
+        "watts": watts,
+        "temp_c": temp_c
+    }
+
+def rounded_rect(ctx, x, y, w, h, r):
+    ctx.new_sub_path()
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+def draw_lightning(ctx, cx, cy, scale=1.0):
+    pts = [
+        (cx + 8 * scale, cy - 65 * scale),
+        (cx - 32 * scale, cy + 5 * scale),
+        (cx - 5 * scale, cy + 5 * scale),
+        (cx - 15 * scale, cy + 70 * scale),
+        (cx + 32 * scale, cy - 5 * scale),
+        (cx + 5 * scale, cy - 5 * scale),
+    ]
+    ctx.new_sub_path()
+    ctx.move_to(pts[0][0], pts[0][1])
+    for px, py in pts[1:]:
+        ctx.line_to(px, py)
+    ctx.close_path()
+    ctx.set_source_rgb(0.0, 0.9, 0.95)
+    ctx.fill()
+
+def render_frame(surface, capacity=50, is_chg=True, boot_progress=0.0, custom_msg=None, sub_msg=None, telemetry=None):
+    ctx = cairo.Context(surface)
+    
+    # Background: Pitch Black
+    ctx.set_source_rgb(0.0, 0.0, 0.0)
+    ctx.paint()
+
+    cx = WIDTH / 2
+    cy = HEIGHT / 2 - 160
+
+    # Outer Battery Outline
+    bw = 360
+    bh = 580
+    bx = cx - bw / 2
+    by = cy - bh / 2
+    br = 38
+
+    # Terminal Cap
+    tw = 120
+    th = 28
+    rounded_rect(ctx, cx - tw / 2, by - th + 4, tw, th, 10)
+    ctx.set_source_rgb(0.25, 0.28, 0.32)
+    ctx.fill()
+
+    # Outer Border
+    rounded_rect(ctx, bx, by, bw, bh, br)
+    ctx.set_source_rgb(0.2, 0.22, 0.25)
+    ctx.set_line_width(12)
+    ctx.stroke()
+
+    # Inner Fill Calculation
+    fill_margin = 16
+    in_w = bw - fill_margin * 2
+    in_max_h = bh - fill_margin * 2
+    in_x = bx + fill_margin
+    clamped_cap = max(0, min(100, capacity))
+    in_h = max(20, (in_max_h * clamped_cap) / 100.0)
+    in_y = by + bh - fill_margin - in_h
+
+    # Color Grading by Battery Percentage
+    if clamped_cap <= 15:
+        fill_color = (0.9, 0.2, 0.2)      # Red
+    elif clamped_cap <= 30:
+        fill_color = (0.95, 0.75, 0.1)    # Amber
+    else:
+        if is_chg:
+            fill_color = (0.05, 0.85, 0.45) # Green
+        else:
+            fill_color = (0.2, 0.6, 0.9)   # Blue
+
+    # Clip and Fill
+    ctx.save()
+    rounded_rect(ctx, in_x, by + fill_margin, in_w, in_max_h, br - 8)
+    ctx.clip()
+
+    pat = cairo.LinearGradient(in_x, in_y + in_h, in_x, in_y)
+    pat.add_color_stop_rgb(0, fill_color[0] * 0.7, fill_color[1] * 0.7, fill_color[2] * 0.7)
+    pat.add_color_stop_rgb(1, fill_color[0], fill_color[1], fill_color[2])
+    ctx.rectangle(in_x, in_y, in_w, in_h)
+    ctx.set_source(pat)
+    ctx.fill()
+    ctx.restore()
+
+    # Lightning Icon (if charging)
+    if is_chg:
+        draw_lightning(ctx, cx, cy, scale=1.35)
+
+    # Percentage Text
+    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    ctx.set_font_size(105)
+    ctx.set_source_rgb(1.0, 1.0, 1.0)
+    pct_text = f"{capacity}%"
+    extents = ctx.text_extents(pct_text)
+    ctx.move_to(cx - extents.width / 2, by + bh + 120)
+    ctx.show_text(pct_text)
+
+    # Status Text Determination
+    ctx.set_font_size(44)
+    if custom_msg:
+        status_text = custom_msg
+        ctx.set_source_rgb(0.7, 0.75, 0.8)
+    elif is_chg:
+        if telemetry and telemetry.get("active_type") == "PD_PPS":
+            status_text = "PPS Fast Charging"
+            ctx.set_source_rgb(0.0, 0.9, 0.95) # Cyan
+        elif telemetry and telemetry.get("active_type") == "PD":
+            if telemetry.get("supports_pps"):
+                status_text = "PD Fast Charging (PPS Capable)"
+            else:
+                status_text = "PD Fast Charging"
+            ctx.set_source_rgb(0.05, 0.9, 0.5) # Bright Emerald Green
+        else:
+            status_text = "Charging"
+            ctx.set_source_rgb(0.7, 0.75, 0.8)
+    elif capacity >= 100:
+        status_text = "Fully Charged"
+        ctx.set_source_rgb(0.4, 0.85, 1.0)
+    else:
+        status_text = "Not Charging"
+        ctx.set_source_rgb(0.6, 0.65, 0.7)
+    
+    extents_st = ctx.text_extents(status_text)
+    ctx.move_to(cx - extents_st.width / 2, by + bh + 185)
+    ctx.show_text(status_text)
+
+    # Power Delivery Telemetry Badge (Watts, Volts, Amps, Temp)
+    if is_chg and telemetry and not custom_msg:
+        watts = telemetry.get("watts", 0.0)
+        volts = telemetry.get("volts", 0.0)
+        amps = telemetry.get("amps", 0.0)
+        temp_c = telemetry.get("temp_c")
+
+        if watts > 0:
+            tele_parts = [f"{watts:.1f}W", f"{volts:.1f}V / {amps:.1f}A"]
+            if temp_c is not None:
+                tele_parts.append(f"{temp_c:.1f}°C")
+            tele_text = " • ".join(tele_parts)
+            
+            ctx.set_font_size(36)
+            ctx.set_source_rgb(0.5, 0.82, 0.95)
+            ext_tele = ctx.text_extents(tele_text)
+            ctx.move_to(cx - ext_tele.width / 2, by + bh + 245)
+            ctx.show_text(tele_text)
+
+            # High temperature warning if > 45°C
+            if temp_c and temp_c >= 45.0:
+                ctx.set_font_size(32)
+                ctx.set_source_rgb(0.95, 0.3, 0.3)
+                warn_text = f"Notice: High Battery Temperature ({temp_c:.1f}°C)"
+                ext_w = ctx.text_extents(warn_text)
+                ctx.move_to(cx - ext_w.width / 2, by + bh + 295)
+                ctx.show_text(warn_text)
+
+    # Sub-Message (e.g. Disconnect Countdown)
+    if sub_msg:
+        ctx.set_font_size(36)
+        ctx.set_source_rgb(0.9, 0.4, 0.4)
+        ext_sub = ctx.text_extents(sub_msg)
+        ctx.move_to(cx - ext_sub.width / 2, by + bh + 245)
+        ctx.show_text(sub_msg)
+
+    # Boot Progress Bar (when holding power key)
+    if boot_progress > 0.0:
+        bar_w = 460
+        bar_h = 16
+        bar_x = cx - bar_w / 2
+        bar_y = by + bh + 270
+        rounded_rect(ctx, bar_x, bar_y, bar_w, bar_h, 8)
+        ctx.set_source_rgb(0.2, 0.2, 0.2)
+        ctx.fill()
+
+        fill_w = min(bar_w, bar_w * boot_progress)
+        rounded_rect(ctx, bar_x, bar_y, fill_w, bar_h, 8)
+        ctx.set_source_rgb(0.0, 0.85, 1.0)
+        ctx.fill()
+
+        ctx.set_font_size(36)
+        ctx.set_source_rgb(0.0, 0.85, 1.0)
+        boot_msg = "Booting System..."
+        ext = ctx.text_extents(boot_msg)
+        ctx.move_to(cx - ext.width / 2, bar_y + 55)
+        ctx.show_text(boot_msg)
+    else:
+        # Bottom Instructions
+        ctx.set_font_size(32)
+        ctx.set_source_rgb(0.4, 0.45, 0.5)
+        hint1 = "Press Power key to check status"
+        hint2 = f"Hold Power key ({int(HOLD_BOOT_TIME)}s) to turn on"
+        ext1 = ctx.text_extents(hint1)
+        ext2 = ctx.text_extents(hint2)
+        ctx.move_to(cx - ext1.width / 2, HEIGHT - 180)
+        ctx.show_text(hint1)
+        ctx.move_to(cx - ext2.width / 2, HEIGHT - 130)
+        ctx.show_text(hint2)
+
+def flush_to_fb(buf_data, mm):
+    for y in range(HEIGHT):
+        mm[y * STRIDE_FB : y * STRIDE_FB + STRIDE_BUF] = buf_data[y * STRIDE_BUF : (y + 1) * STRIDE_BUF]
+
+def clear_fb(mm):
+    blank = b'\x00' * (STRIDE_FB * HEIGHT)
+    mm[:] = blank
+
+def main():
+    running = True
+
+    def sig_handler(sig, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
+
+    # Open Framebuffer device
+    try:
+        fb_fd = os.open(FB_PATH, os.O_RDWR)
+        mm = mmap.mmap(fb_fd, STRIDE_FB * HEIGHT)
+    except Exception as e:
+        sys.stderr.write(f"Failed to open framebuffer {FB_PATH}: {e}\n")
+        sys.exit(1)
+
+    # Double buffer surface
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH, HEIGHT)
+
+    # Open available input devices
+    input_fds = {}
+    for path in INPUT_PATHS:
+        if os.path.exists(path):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                input_fds[fd] = path
+            except Exception:
+                pass
+
+    screen_on = True
+    screen_off_deadline = time.time() + TIMEOUT_SCREEN_OFF
+    set_backlight(ACTIVE_BRIGHTNESS)
+
+    power_pressed = False
+    power_press_start = 0.0
+    unplug_start = None
+    last_render_time = 0.0
+
+    while running:
+        now = time.time()
+
+        # Monitor charger state
+        connected = is_charger_connected()
+        if not connected:
+            if unplug_start is None:
+                unplug_start = now
+                screen_on = True
+                set_backlight(ACTIVE_BRIGHTNESS)
+                screen_off_deadline = now + UNPLUG_GRACE_TIME + 2.0
+            
+            elapsed_unplug = now - unplug_start
+            if elapsed_unplug >= UNPLUG_GRACE_TIME:
+                # Power off cleanly
+                render_frame(
+                    surface,
+                    capacity=read_sysfs_int(BAT_CAP_PATH, 0),
+                    is_chg=False,
+                    custom_msg="Cable Disconnected",
+                    sub_msg="Powering off..."
+                )
+                flush_to_fb(surface.get_data(), mm)
+                time.sleep(1.2)
+                clear_fb(mm)
+                set_backlight(0)
+                os.system("systemctl poweroff")
+                sys.exit(0)
+        else:
+            unplug_start = None
+
+        # Screen timeout logic
+        if screen_on and now >= screen_off_deadline and not power_pressed:
+            screen_on = False
+            clear_fb(mm)
+            set_backlight(0)
+
+        # Power key long-press to boot
+        boot_progress = 0.0
+        if power_pressed:
+            hold_duration = now - power_press_start
+            boot_progress = min(1.0, hold_duration / HOLD_BOOT_TIME)
+            if hold_duration >= HOLD_BOOT_TIME:
+                render_frame(
+                    surface,
+                    capacity=read_sysfs_int(BAT_CAP_PATH, 0),
+                    is_chg=connected,
+                    boot_progress=1.0,
+                    custom_msg="Booting Kali Linux..."
+                )
+                flush_to_fb(surface.get_data(), mm)
+                set_backlight(1000)
+                time.sleep(0.5)
+                # Seamless transition to graphical target
+                os.system("systemctl isolate graphical.target")
+                sys.exit(0)
+
+        # Poll input events with dynamic timeout (low CPU when sleeping)
+        r_fds = list(input_fds.keys())
+        timeout = 0.05 if (power_pressed or (screen_on and not connected)) else (0.5 if screen_on else 1.0)
+        readable, _, _ = select.select(r_fds, [], [], timeout)
+
+        for fd in readable:
+            path = input_fds[fd]
+            try:
+                while True:
+                    data = os.read(fd, 24)
+                    if len(data) < 24:
+                        break
+                    sec, usec, ev_type, ev_code, ev_val = struct.unpack("qqHHi", data)
+                    
+                    # EV_KEY = 1
+                    if ev_type == 1:
+                        if not screen_on:
+                            screen_on = True
+                            set_backlight(ACTIVE_BRIGHTNESS)
+                            screen_off_deadline = time.time() + TIMEOUT_SCREEN_OFF
+                            if ev_code == 116: # KEY_POWER
+                                power_pressed = False
+                            continue
+                        
+                        if "pwrkey" in path or ev_code == 116:
+                            if ev_val == 1: # Key Down
+                                power_pressed = True
+                                power_press_start = time.time()
+                                screen_off_deadline = time.time() + TIMEOUT_SCREEN_OFF
+                            elif ev_val == 0: # Key Up
+                                if power_pressed:
+                                    power_pressed = False
+                                    boot_progress = 0.0
+                                    screen_off_deadline = time.time() + TIMEOUT_SCREEN_OFF
+                        else:
+                            # Volume keys wake / extend timeout
+                            if ev_val == 1:
+                                screen_off_deadline = time.time() + TIMEOUT_SCREEN_OFF
+            except (BlockingIOError, OSError):
+                pass
+
+        # Frame refresh when screen is active
+        if screen_on:
+            now_t = time.time()
+            if power_pressed or unplug_start is not None or (now_t - last_render_time >= 0.5):
+                last_render_time = now_t
+                cap = read_sysfs_int(BAT_CAP_PATH, 0)
+                
+                custom_msg = None
+                sub_msg = None
+                if unplug_start is not None:
+                    elapsed = now_t - unplug_start
+                    sec_left = max(1, int(math.ceil(UNPLUG_GRACE_TIME - elapsed)))
+                    custom_msg = "Cable Disconnected"
+                    sub_msg = f"Powering off in {sec_left}s..."
+                
+                telemetry = get_charging_telemetry() if connected else None
+
+                render_frame(
+                    surface,
+                    capacity=cap,
+                    is_chg=connected,
+                    boot_progress=boot_progress,
+                    custom_msg=custom_msg,
+                    sub_msg=sub_msg,
+                    telemetry=telemetry
+                )
+                flush_to_fb(surface.get_data(), mm)
+
+    # Clean cleanup
+    for fd in input_fds:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    clear_fb(mm)
+    del surface
+    mm.close()
+    os.close(fb_fd)
+    set_backlight(1000)
+
+if __name__ == "__main__":
+    main()

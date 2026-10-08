@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+NORMAL_DIR="$1"
+EARLY_DIR="$2"
+
+# If the bootloader passed androidboot.mode=charger, redirect default boot to charger.target
+if grep -q "androidboot.mode=charger" /proc/cmdline; then
+    if [ -n "$EARLY_DIR" ]; then
+        mkdir -p "$EARLY_DIR"
+        ln -sf /etc/systemd/system/charger.target "$EARLY_DIR/default.target"
+    fi
+    if [ -n "$NORMAL_DIR" ]; then
+        mkdir -p "$NORMAL_DIR"
+        ln -sf /etc/systemd/system/charger.target "$NORMAL_DIR/default.target"
+    fi
+fi

@@ -1,0 +1,18 @@
+[Unit]
+Description=Offline Battery Charging UI and Power Daemon
+Documentation=man:systemd.special(7)
+DefaultDependencies=no
+After=basic.target
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/plymouth quit
+ExecStart=/usr/local/bin/offline-charger
+Restart=always
+RestartSec=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=charger.target
